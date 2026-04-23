@@ -2,3 +2,5 @@
 *.py[cod]
 bench/scalpel_bench/results/
 bench/scalpel_bench/results*/
+.idea/
+*.iml
