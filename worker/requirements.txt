@@ -1,0 +1,7 @@
+# worker/requirements.txt
+redis
+sqlalchemy
+pymysql
+cryptography
+psutil
+numpy
