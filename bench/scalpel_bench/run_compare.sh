@@ -11,7 +11,6 @@ BASELINE_TAG="scalpel-worker:baseline"
 OPTIMIZED_TAG="scalpel-worker:optimized"
 REPEAT_COUNT=1
 BUILD_ONLY=0
-CLEAR_CACHES=1
 
 usage() {
   cat <<'EOF'
@@ -24,23 +23,11 @@ Usage: ./bench/scalpel_bench/run_compare.sh \
   [--baseline-tag scalpel-worker:baseline] \
   [--optimized-tag scalpel-worker:optimized] \
   [--repeat-count 5] \
-  [--skip-drop-caches] \
   [--build-only]
-EOF
-}
 
-# [수정] 스크립트 시작 시 sudo 권한을 미리 확보하는 함수
-check_sudo_privilege() {
-  if [[ "$CLEAR_CACHES" -eq 1 && "$(uname -s)" == "Linux" ]]; then
-    if [[ $EUID -ne 0 ]]; then
-      echo "Cache clearing is enabled. Checking sudo access..."
-      # sudo -v는 비밀번호를 확인하고 타임스탬프를 갱신합니다.
-      if ! sudo -v; then
-        echo "Error: Root privilege is required to drop caches." >&2
-        exit 1
-      fi
-    fi
-  fi
+Note: Cache dropping is disabled in this script. 
+Please run 'sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches' manually if needed.
+EOF
 }
 
 resolve_existing_path() {
@@ -85,23 +72,9 @@ normalize_text_log() {
   [[ -f "$path" ]] && perl -0pi -e 's/\r\n/\n/g; s/\r/\n/g' "$path"
 }
 
-# [수정] 캐시 삭제 로직 최적화
+# [수정] 아무 일도 하지 않도록 비활성화
 drop_linux_page_cache() {
-  local label="$1"
-  [[ "$CLEAR_CACHES" -ne 1 ]] && return
-  [[ "$(uname -s)" != "Linux" ]] && return
-
-  echo "Dropping Linux page cache before $label..."
-  
-  # 1. 루트 권한이 있는 경우 직접 실행
-  if [[ -w /proc/sys/vm/drop_caches ]]; then
-    sync && echo 3 > /proc/sys/vm/drop_caches
-  # 2. 아닌 경우 sudo로 실행 (이미 위에서 sudo -v를 했으므로 nohup에서도 성공함)
-  else
-    sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' || {
-      echo "Warning: Failed to drop caches for $label. Continuing anyway..." >&2
-    }
-  fi
+  echo "Notice: Skipping automatic cache drop (Manual control mode)."
 }
 
 invoke_scalpel_run() {
@@ -113,6 +86,7 @@ invoke_scalpel_run() {
   local stderr_file="$run_root/stderr.txt"
   local summary_file="$run_root/summary.json"
 
+  # 캐시 삭제 로직은 실행되지만 위에서 비활성화됨
   drop_linux_page_cache "$label"
 
   rm -rf "$run_root" && mkdir -p "$out_dir"
@@ -134,7 +108,6 @@ invoke_scalpel_run() {
   "$python_bin" bench/scalpel_bench/summarize_scalpel_run.py "$time_file" "$stdout_file" "$out_dir" >"$summary_file"
 }
 
-# --- Argument Parsing ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --baseline-source-subdir) BASELINE_SOURCE_SUBDIR="$2"; shift 2 ;;
@@ -145,7 +118,6 @@ while [[ $# -gt 0 ]]; do
     --baseline-tag) BASELINE_TAG="$2"; shift 2 ;;
     --optimized-tag) OPTIMIZED_TAG="$2"; shift 2 ;;
     --repeat-count) REPEAT_COUNT="$2"; shift 2 ;;
-    --skip-drop-caches) CLEAR_CACHES=0; shift ;;
     --build-only) BUILD_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -160,9 +132,6 @@ IMAGE_PATH="$(resolve_existing_path "$IMAGE_PATH")"
 CONFIG_PATH="$(resolve_config_path)"
 OUTPUT_ROOT="$(resolve_output_root)"
 PYTHON_BIN="$(detect_python)"
-
-# [추가] 실행 전 sudo 권한 체크
-check_sudo_privilege
 
 build_worker_image "$BASELINE_TAG" "$BASELINE_SOURCE_SUBDIR"
 build_worker_image "$OPTIMIZED_TAG" "$OPTIMIZED_SOURCE_SUBDIR"
