@@ -9,6 +9,7 @@ images and running the installed `scalpel2` binary against the same image and co
 - optimized source subdirectory
 - disk image path
 - scalpel config path (optional, omitted 시 `worker/scalpel2.conf` -> `worker/scalpel.conf` 순서로 자동 선택)
+- Linux page cache drop before each run (default on `run_compare.sh`, disable with `--skip-drop-caches`)
 
 ## Outputs
 
@@ -76,6 +77,12 @@ Ubuntu / Bash:
 ```
 
 If you only want to validate builds first, add `-BuildOnly`.
+
+On Ubuntu/Linux, `run_compare.sh` drops the page cache before each benchmark run by
+default so repeated measurements are less affected by warmed filesystem cache. This
+requires root privileges to write `/proc/sys/vm/drop_caches`, so run the script as
+root or make sure `sudo -n` works for the current user. If you want to keep the
+current cache state, add `--skip-drop-caches`.
 
 ## Repeated runs
 

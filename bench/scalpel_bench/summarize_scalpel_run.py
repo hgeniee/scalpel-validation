@@ -15,6 +15,15 @@ SCALPEL_PATTERNS = {
     "initialized_queues": re.compile(
         r"Work queues built using (\d+)/(\d+) initialized queues, CONTINUECARVE entries = (\d+)\."
     ),
+    "event_schedule": re.compile(
+        r"Event schedule built using (\d+)/(\d+) initialized blocks, CONTINUE spans avoided = (\d+)\."
+    ),
+    "performance_metrics": re.compile(
+        r"Performance metrics:\s+pass1_scan_sec=([0-9.]+)\s+queue_build_sec=([0-9.]+)\s+pass2_read_sec=([0-9.]+)\s+pass2_write_sec=([0-9.]+)\s+pass2_open_close_sec=([0-9.]+)\s+pass2_total_sec=([0-9.]+)"
+    ),
+    "performance_counters": re.compile(
+        r"Performance counters:\s+handle_open_count=(\d+)\s+handle_reopen_count=(\d+)\s+handle_close_count=(\d+)\s+handle_eviction_count=(\d+)\s+peak_open_handles=(\d+)\s+peak_active_carves=(\d+)\s+pass2_bytes_written=(\d+)"
+    ),
 }
 
 
@@ -43,6 +52,34 @@ def parse_stdout(text: str) -> dict[str, object]:
             int(queues.group(1)) / int(queues.group(2)), 4
         )
 
+    events = SCALPEL_PATTERNS["event_schedule"].search(text)
+    if events:
+        result["initialized_block_count"] = int(events.group(1))
+        result["event_table_count"] = int(events.group(2))
+        result["continue_span_block_count"] = int(events.group(3))
+        result["block_activation_ratio"] = round(
+            int(events.group(1)) / int(events.group(2)), 4
+        )
+
+    perf = SCALPEL_PATTERNS["performance_metrics"].search(text)
+    if perf:
+        result["pass1_scan_sec"] = float(perf.group(1))
+        result["queue_build_sec"] = float(perf.group(2))
+        result["pass2_read_sec"] = float(perf.group(3))
+        result["pass2_write_sec"] = float(perf.group(4))
+        result["pass2_open_close_sec"] = float(perf.group(5))
+        result["pass2_total_sec"] = float(perf.group(6))
+
+    counters = SCALPEL_PATTERNS["performance_counters"].search(text)
+    if counters:
+        result["handle_open_count"] = int(counters.group(1))
+        result["handle_reopen_count"] = int(counters.group(2))
+        result["handle_close_count"] = int(counters.group(3))
+        result["handle_eviction_count"] = int(counters.group(4))
+        result["peak_open_handles"] = int(counters.group(5))
+        result["peak_active_carves"] = int(counters.group(6))
+        result["pass2_bytes_written"] = int(counters.group(7))
+
     return result
 
 
@@ -60,6 +97,20 @@ def summarize_output_dir(path: Path) -> dict[str, object]:
     }
 
 
+def read_log_text(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "utf-8"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="replace")
+
+    return text.replace("\x00", "")
+
+
 def main() -> int:
     if len(sys.argv) != 4:
         print(
@@ -72,8 +123,8 @@ def main() -> int:
     stdout_path = Path(sys.argv[2])
     output_dir = Path(sys.argv[3])
 
-    summary = parse_text(time_path.read_text(encoding="utf-8", errors="replace"))
-    summary.update(parse_stdout(stdout_path.read_text(encoding="utf-8", errors="replace")))
+    summary = parse_text(read_log_text(time_path))
+    summary.update(parse_stdout(read_log_text(stdout_path)))
     summary.update(summarize_output_dir(output_dir))
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))

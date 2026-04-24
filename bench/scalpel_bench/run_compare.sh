@@ -11,6 +11,7 @@ BASELINE_TAG="scalpel-worker:baseline"
 OPTIMIZED_TAG="scalpel-worker:optimized"
 REPEAT_COUNT=1
 BUILD_ONLY=0
+CLEAR_CACHES=1
 
 usage() {
   cat <<'EOF'
@@ -23,7 +24,12 @@ Usage: ./bench/scalpel_bench/run_compare.sh \
   [--baseline-tag scalpel-worker:baseline] \
   [--optimized-tag scalpel-worker:optimized] \
   [--repeat-count 5] \
+  [--skip-drop-caches] \
   [--build-only]
+
+By default, the script runs `sync` and drops the Linux page cache
+(`echo 3 > /proc/sys/vm/drop_caches`) before each baseline/optimized run.
+Use `--skip-drop-caches` only when you intentionally want warm-cache runs.
 EOF
 }
 
@@ -107,6 +113,38 @@ normalize_text_log() {
   perl -0pi -e 's/\r\n/\n/g; s/\r/\n/g' "$path"
 }
 
+drop_linux_page_cache() {
+  local label="$1"
+
+  if [[ "$CLEAR_CACHES" -ne 1 ]]; then
+    return
+  fi
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "Skipping cache drop before $label: only supported on Linux." >&2
+    return
+  fi
+
+  echo "Dropping Linux page cache before $label"
+
+  if [[ -w /proc/sys/vm/drop_caches ]]; then
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+    return
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    if sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'; then
+      return
+    fi
+    echo "Failed to drop caches before $label: need root or passwordless sudo. Use --skip-drop-caches to continue without cache clearing." >&2
+    exit 1
+  fi
+
+  echo "Failed to drop caches before $label: need root access to write /proc/sys/vm/drop_caches. Use --skip-drop-caches to continue without cache clearing." >&2
+  exit 1
+}
+
 invoke_scalpel_run() {
   local tag="$1"
   local label="$2"
@@ -125,6 +163,8 @@ invoke_scalpel_run() {
   local config_dir
   local config_name
   local command
+
+  drop_linux_page_cache "$label"
 
   rm -rf "$run_root"
   mkdir -p "$out_dir"
@@ -188,6 +228,10 @@ while [[ $# -gt 0 ]]; do
       REPEAT_COUNT="$2"
       shift 2
       ;;
+    --skip-drop-caches)
+      CLEAR_CACHES=0
+      shift
+      ;;
     --build-only)
       BUILD_ONLY=1
       shift
@@ -213,6 +257,12 @@ IMAGE_PATH="$(resolve_existing_path "$IMAGE_PATH")"
 CONFIG_PATH="$(resolve_config_path)"
 OUTPUT_ROOT="$(resolve_output_root)"
 PYTHON_BIN="$(detect_python)"
+
+if [[ "$CLEAR_CACHES" -eq 1 ]]; then
+  echo "Cache policy: cold-cache runs enabled (drop caches before each run on Linux)."
+else
+  echo "Cache policy: warm-cache runs enabled (--skip-drop-caches)."
+fi
 
 build_worker_image "$BASELINE_TAG" "$BASELINE_SOURCE_SUBDIR"
 build_worker_image "$OPTIMIZED_TAG" "$OPTIMIZED_SOURCE_SUBDIR"

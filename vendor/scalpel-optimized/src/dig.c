@@ -118,21 +118,112 @@ static int setupAuditFile(struct scalpelState *state);
 static int digBuffer(struct scalpelState *state,
 		     unsigned long long lengthofbuf,
 		     unsigned long long offset);
-// 헤더 offset 배열은 +100 증가 대신 doubling으로 확장해 realloc 횟수를 줄인다.
 static void ensureHeaderStorageCapacity(struct scalpelState *state,
 					struct SearchSpecLine *currentneedle);
-// 푸터 offset 배열도 동일하게 doubling 전략을 사용한다.
 static void ensureFooterStorageCapacity(struct scalpelState *state,
 					struct SearchSpecLine *currentneedle);
-// work queue는 실제 작업이 들어가는 블록에서만 지연 초기화한다.
-static void ensureCarvelistInitialized(struct scalpelState *state,
-				       Queue *carvelists,
-				       unsigned char *carvelistInitialized,
-				       unsigned long long queueindex,
-				       unsigned long long *initializedQueues);
+static double currentTimeSeconds(void);
+static void recordReadTime(double startedAt);
+static void recordWriteTime(double startedAt);
+static void recordQueueTime(double startedAt);
+static void recordSearchTime(double startedAt);
+static void printPerformanceMetrics(double pass2TotalSec,
+				    double pass2OpenCloseSec,
+				    unsigned long long handleOpenCount,
+				    unsigned long long handleReopenCount,
+				    unsigned long long handleCloseCount,
+				    unsigned long long handleEvictionCount,
+				    unsigned long long peakOpenHandles,
+				    unsigned long long peakActiveCarves,
+				    unsigned long long bytesWritten);
 #ifdef MULTICORE_THREADING
 static void *threadedFindAll(void *args);
 #endif
+
+#define CARVE_IO_BUFFER_SIZE (1 * MEGABYTE)
+
+typedef struct BlockCarveEvents {
+  struct CarveInfo *start_head;
+  struct CarveInfo *stop_head;
+  struct CarveInfo *same_head;
+  unsigned char has_work;
+} BlockCarveEvents;
+
+typedef struct FileHandleCache {
+  struct CarveInfo *lru_head;
+  struct CarveInfo *lru_tail;
+  unsigned long long open_count;
+  unsigned long long peak_open_count;
+  unsigned long long open_ops;
+  unsigned long long reopen_ops;
+  unsigned long long close_ops;
+  unsigned long long eviction_ops;
+  unsigned long long max_open;
+  double open_close_sec;
+  unsigned long long bytes_written;
+} FileHandleCache;
+
+static double
+currentTimeSeconds(void) {
+#ifdef _WIN32
+  LARGE_INTEGER now;
+  LARGE_INTEGER freq;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&freq);
+  return ((double) now.QuadPart) / ((double) freq.QuadPart);
+#else
+  struct timeval now;
+  gettimeofday(&now, 0);
+  return ((double) now.tv_sec) + (((double) now.tv_usec) / 1000000.0);
+#endif
+}
+
+static void
+recordReadTime(double startedAt) {
+  totalreads += currentTimeSeconds() - startedAt;
+}
+
+static void
+recordWriteTime(double startedAt) {
+  totalwrites += currentTimeSeconds() - startedAt;
+}
+
+static void
+recordQueueTime(double startedAt) {
+  totalqueues += currentTimeSeconds() - startedAt;
+}
+
+static void
+recordSearchTime(double startedAt) {
+  totalsearch += currentTimeSeconds() - startedAt;
+}
+
+static void
+printPerformanceMetrics(double pass2TotalSec,
+			 double pass2OpenCloseSec,
+			 unsigned long long handleOpenCount,
+			 unsigned long long handleReopenCount,
+			 unsigned long long handleCloseCount,
+			 unsigned long long handleEvictionCount,
+			 unsigned long long peakOpenHandles,
+			 unsigned long long peakActiveCarves,
+			 unsigned long long bytesWritten) {
+  fprintf(stdout,
+	  "Performance metrics: pass1_scan_sec=%.6f queue_build_sec=%.6f pass2_read_sec=%.6f pass2_write_sec=%.6f pass2_open_close_sec=%.6f pass2_total_sec=%.6f\n",
+	  totalsearch, totalqueues, totalreads, totalwrites,
+	  pass2OpenCloseSec, pass2TotalSec);
+#ifdef _WIN32
+  fprintf(stdout,
+	  "Performance counters: handle_open_count=%I64u handle_reopen_count=%I64u handle_close_count=%I64u handle_eviction_count=%I64u peak_open_handles=%I64u peak_active_carves=%I64u pass2_bytes_written=%I64u\n",
+	  handleOpenCount, handleReopenCount, handleCloseCount,
+	  handleEvictionCount, peakOpenHandles, peakActiveCarves, bytesWritten);
+#else
+  fprintf(stdout,
+	  "Performance counters: handle_open_count=%llu handle_reopen_count=%llu handle_close_count=%llu handle_eviction_count=%llu peak_open_handles=%llu peak_active_carves=%llu pass2_bytes_written=%llu\n",
+	  handleOpenCount, handleReopenCount, handleCloseCount,
+	  handleEvictionCount, peakOpenHandles, peakActiveCarves, bytesWritten);
+#endif
+}
 
 static void
 ensureHeaderStorageCapacity(struct scalpelState *state,
@@ -223,31 +314,251 @@ ensureFooterStorageCapacity(struct scalpelState *state,
   }
 }
 
+static void
+touchCarveHandle(FileHandleCache *cache, struct CarveInfo *carve) {
+  if(carve->lru_prev) {
+    carve->lru_prev->lru_next = carve->lru_next;
+  }
+  else if(cache->lru_head == carve) {
+    cache->lru_head = carve->lru_next;
+  }
+
+  if(carve->lru_next) {
+    carve->lru_next->lru_prev = carve->lru_prev;
+  }
+  else if(cache->lru_tail == carve) {
+    cache->lru_tail = carve->lru_prev;
+  }
+
+  carve->lru_prev = 0;
+  carve->lru_next = cache->lru_head;
+  if(cache->lru_head) {
+    cache->lru_head->lru_prev = carve;
+  }
+  else {
+    cache->lru_tail = carve;
+  }
+  cache->lru_head = carve;
+}
+
+static int
+closeCarveFile(struct scalpelState *state,
+		 FileHandleCache *cache,
+		 struct CarveInfo *carve,
+		 int finalClose) {
+  double closeStartedAt = 0.0;
+  int err = 0;
+
+  if(!carve->fp || state->previewMode) {
+    if(finalClose) {
+      carve->completed = 1;
+    }
+    return SCALPEL_OK;
+  }
+
+  closeStartedAt = currentTimeSeconds();
+  err = fclose(carve->fp);
+  cache->open_close_sec += currentTimeSeconds() - closeStartedAt;
+  if(err) {
+    fprintf(stderr, "Error closing file: %s -- %s\n\n",
+	    carve->filename, strerror(errno));
+    fprintf(state->auditFile,
+	    "Error closing file: %s -- %s\n\n",
+	    carve->filename, strerror(errno));
+    return SCALPEL_ERROR_FILE_WRITE;
+  }
+
+  cache->close_ops++;
+  if(cache->open_count > 0) {
+    cache->open_count--;
+  }
+  if(carve->lru_prev) {
+    carve->lru_prev->lru_next = carve->lru_next;
+  }
+  else if(cache->lru_head == carve) {
+    cache->lru_head = carve->lru_next;
+  }
+  if(carve->lru_next) {
+    carve->lru_next->lru_prev = carve->lru_prev;
+  }
+  else if(cache->lru_tail == carve) {
+    cache->lru_tail = carve->lru_prev;
+  }
+  carve->lru_prev = 0;
+  carve->lru_next = 0;
+  carve->fp = 0;
+  if(carve->iobuf) {
+    free(carve->iobuf);
+    carve->iobuf = 0;
+  }
+
+  if(finalClose) {
+    carve->completed = 1;
+  }
+  return SCALPEL_OK;
+}
+
+static int
+ensureCarveFileOpen(struct scalpelState *state,
+		    FileHandleCache *cache,
+		    struct CarveInfo *carve) {
+  double openStartedAt = 0.0;
+  int reopening = carve->opened_once;
+
+  if(state->previewMode) {
+    return SCALPEL_OK;
+  }
+
+  if(carve->fp) {
+    touchCarveHandle(cache, carve);
+    return SCALPEL_OK;
+  }
+
+  while(cache->open_count >= cache->max_open && cache->lru_tail) {
+    struct CarveInfo *evicted = cache->lru_tail;
+    int err;
+    cache->eviction_ops++;
+    err = closeCarveFile(state, cache, evicted, FALSE);
+    if(err != SCALPEL_OK) {
+      return err;
+    }
+  }
+
+  openStartedAt = currentTimeSeconds();
+  carve->fp = fopen(carve->filename, carve->opened_once ? "ab" : "wb");
+  cache->open_close_sec += currentTimeSeconds() - openStartedAt;
+  if(!carve->fp) {
+    fprintf(stderr, "Error opening file: %s -- %s\n",
+	    carve->filename, strerror(errno));
+    fprintf(state->auditFile, "Error opening file: %s -- %s\n",
+	    carve->filename, strerror(errno));
+    return SCALPEL_ERROR_FILE_WRITE;
+  }
+
+  carve->iobuf = (char *) malloc(CARVE_IO_BUFFER_SIZE);
+  if(carve->iobuf) {
+    setvbuf(carve->fp, carve->iobuf, _IOFBF, CARVE_IO_BUFFER_SIZE);
+  }
+
+  carve->opened_once = 1;
+  cache->open_count++;
+  if(cache->open_count > cache->peak_open_count) {
+    cache->peak_open_count = cache->open_count;
+  }
+  cache->open_ops++;
+  if(reopening) {
+    cache->reopen_ops++;
+  }
+  touchCarveHandle(cache, carve);
+  return SCALPEL_OK;
+}
 
 static void
-ensureCarvelistInitialized(struct scalpelState *state,
-			   Queue *carvelists,
-			   unsigned char *carvelistInitialized,
-			   unsigned long long queueindex,
-			   unsigned long long *initializedQueues) {
-
-  if(carvelistInitialized[queueindex]) {
+addActiveCarve(struct CarveInfo **activeHead,
+		 struct CarveInfo *carve,
+		 unsigned long long *activeCount,
+		 unsigned long long *peakActiveCount) {
+  if(carve->is_active) {
     return;
   }
 
-  // 전체 블록을 미리 초기화하지 않고 실제 carve가 걸리는 블록만 큐를 만든다.
-  init_queue(&carvelists[queueindex], sizeof(struct CarveInfo *), TRUE, 0, TRUE);
-  carvelistInitialized[queueindex] = TRUE;
-  if(initializedQueues) {
-    (*initializedQueues)++;
+  carve->active_prev = 0;
+  carve->active_next = *activeHead;
+  if(*activeHead) {
+    (*activeHead)->active_prev = carve;
   }
-  if(state->modeVerbose) {
-#ifdef _WIN32
-    fprintf(stdout, "Initialized work queue %I64u on demand.\n", queueindex);
-#else
-    fprintf(stdout, "Initialized work queue %llu on demand.\n", queueindex);
-#endif
+  *activeHead = carve;
+  carve->is_active = 1;
+  (*activeCount)++;
+  if(*activeCount > *peakActiveCount) {
+    *peakActiveCount = *activeCount;
   }
+}
+
+static void
+removeActiveCarve(struct CarveInfo **activeHead,
+		    struct CarveInfo *carve,
+		    unsigned long long *activeCount) {
+  if(!carve->is_active) {
+    return;
+  }
+
+  if(carve->active_prev) {
+    carve->active_prev->active_next = carve->active_next;
+  }
+  else {
+    *activeHead = carve->active_next;
+  }
+  if(carve->active_next) {
+    carve->active_next->active_prev = carve->active_prev;
+  }
+  carve->active_prev = 0;
+  carve->active_next = 0;
+  carve->is_active = 0;
+  if(*activeCount > 0) {
+    (*activeCount)--;
+  }
+}
+
+static int
+writeCarveBlock(struct scalpelState *state,
+		  FileHandleCache *cache,
+		  struct CarveInfo *carve,
+		  unsigned long long blockStart,
+		  unsigned long long bytesread,
+		  int sameBlockOnly) {
+  unsigned long long carveStart;
+  unsigned long long carveStop;
+  unsigned long long offset;
+  unsigned long long bytestowrite;
+  size_t byteswritten;
+  int err;
+  double writeStartedAt;
+
+  carveStart = carve->start > blockStart ? carve->start : blockStart;
+  carveStop = carve->stop < (blockStart + bytesread - 1) ?
+    carve->stop : (blockStart + bytesread - 1);
+
+  if(carveStop < carveStart) {
+    return SCALPEL_OK;
+  }
+
+  offset = carveStart - blockStart;
+  bytestowrite = carveStop - carveStart + 1;
+
+  if(!state->previewMode) {
+    err = ensureCarveFileOpen(state, cache, carve);
+    if(err != SCALPEL_OK) {
+      return err;
+    }
+
+    writeStartedAt = currentTimeSeconds();
+    byteswritten = fwrite(readbuffer + offset, sizeof(char),
+			  (size_t) bytestowrite, carve->fp);
+    recordWriteTime(writeStartedAt);
+    if(byteswritten != (size_t) bytestowrite) {
+      fprintf(stderr, "Error writing to file: %s -- %s\n",
+	      carve->filename, strerror(errno));
+      fprintf(state->auditFile,
+	      "Error writing to file: %s -- %s\n",
+	      carve->filename, strerror(errno));
+      return SCALPEL_ERROR_FILE_WRITE;
+    }
+    cache->bytes_written += bytestowrite;
+  }
+
+  if(sameBlockOnly || carve->stopblock == (blockStart / SIZE_OF_BUFFER)) {
+    err = closeCarveFile(state, cache, carve, TRUE);
+    if(err != SCALPEL_OK) {
+      return err;
+    }
+    auditUpdateCoverageBlockmap(state, carve);
+    free(carve->filename);
+    carve->filename = 0;
+    return SCALPEL_OK;
+  }
+
+  return SCALPEL_OK;
 }
 
 
@@ -799,9 +1110,15 @@ void *streaming_reader(void *sss) {
   readbuf_info *rinfo = (readbuf_info *)get(empty_readbuf);
 
   // Read chunk of image into empty buffer.
-  while ((bytesread =
-	  fread_use_coverage_map(state, rinfo->readbuf, 1, SIZE_OF_BUFFER,
-				 state->infile)) > longestneedle - 1) {
+  while (1) {
+    double readStartedAt = currentTimeSeconds();
+    bytesread =
+      fread_use_coverage_map(state, rinfo->readbuf, 1, SIZE_OF_BUFFER,
+			     state->infile);
+    recordReadTime(readStartedAt);
+    if(bytesread <= longestneedle - 1) {
+      break;
+    }
 
     if(state->modeVerbose) {
 #ifdef _WIN32
@@ -963,15 +1280,20 @@ int digImageFile(struct scalpelState *state) {
 
     readbuf_info *rinfo = (readbuf_info *)get(full_readbuf);
     readbuffer = rinfo->readbuf;
-    if((status =
-	digBuffer(state, rinfo->bytesread, rinfo->beginreadpos
-		  )) != SCALPEL_OK) {
+    {
+      double searchStartedAt = currentTimeSeconds();
+      status = digBuffer(state, rinfo->bytesread, rinfo->beginreadpos);
+      recordSearchTime(searchStartedAt);
+    }
+    if(status != SCALPEL_OK) {
       return status;
     }
     put(empty_readbuf, (void *)rinfo);
   }
 
 #endif
+
+  pthread_join(reader, NULL);
 
   return SCALPEL_OK;
 }
@@ -1002,22 +1324,20 @@ int carveImageFile(struct scalpelState *state) {
   int success = 0;
   long long i, j;
   int halt;
-  unsigned long long queuecount;
-  unsigned long long initializedQueues = 0;
-  unsigned long long continueCarveEntries = 0;
+  unsigned long long blockcount;
+  unsigned long long initializedBlocks = 0;
   char chopped;			// file chopped because it exceeds
   // max carve size for type?
-  int CURRENTFILESOPEN = 0;	// number of files open (during carve)
   unsigned long long firstcandidatefooter=0;
-
-  // index of header and footer within image file, in SIZE_OF_BUFFER
-  // blocks
   unsigned long long headerblockindex, footerblockindex;
-
-  struct Queue *carvelists;	// one entry for each SIZE_OF_BUFFER bytes of
-  // input file
-  unsigned char *carvelistInitialized;
-//  struct timeval queuenow, queuethen;
+  unsigned long long continueCarveSpans = 0;
+  unsigned long long activeCarveCount = 0;
+  unsigned long long peakActiveCarves = 0;
+  double queueStartedAt;
+  double pass2StartedAt;
+  BlockCarveEvents *eventsByBlock;
+  FileHandleCache handleCache;
+  struct CarveInfo *activeCarves = 0;
 
   // open image file and get size so carvelists can be allocated
   if((infile = fopen(state->imagefile, "rb")) == NULL) {
@@ -1052,27 +1372,22 @@ int carveImageFile(struct scalpelState *state) {
     return SCALPEL_ERROR_FILE_READ;
   }
 
+  totalreads = 0.0;
+  totalwrites = 0.0;
 
-//  gettimeofday(&queuethen, 0);
+  blockcount = 2 + (filesize / SIZE_OF_BUFFER);
+  eventsByBlock =
+    (BlockCarveEvents *) calloc(blockcount, sizeof(BlockCarveEvents));
+  checkMemoryAllocation(state, eventsByBlock, __LINE__, __FILE__,
+			"carve event table");
 
-  // allocate memory for carvelists--we alloc a queue for each
-  // SIZE_OF_BUFFER bytes in advance because it's simpler and an empty
-  // queue doesn't consume much memory, anyway.
+  memset(&handleCache, 0, sizeof(handleCache));
+  handleCache.max_open = MAX_FILES_TO_OPEN;
 
-  queuecount = 2 + (filesize / SIZE_OF_BUFFER);
-  // Queue 구조체 배열만 먼저 확보하고, 내부 큐는 필요할 때 초기화한다.
-  carvelists =
-    (Queue *) calloc(queuecount, sizeof(Queue));
-  checkMemoryAllocation(state, carvelists, __LINE__, __FILE__, "carvelists");
-  carvelistInitialized =
-    (unsigned char *) calloc(queuecount, sizeof(unsigned char));
-  checkMemoryAllocation(state, carvelistInitialized, __LINE__, __FILE__,
-			"carvelist initialization map");
+  fprintf(stdout, "Allocating carve event table...\n");
+  fprintf(stdout, "Carve event table ready. Building start/stop events...\n");
 
-  fprintf(stdout, "Allocating work queue table...\n");
-  fprintf(stdout, "Work queue table ready. Building work queues lazily...\n");
-
-  // build carvelists before 2nd pass over image file
+  queueStartedAt = currentTimeSeconds();
 
   for(needlenum = 0; needlenum < state->specLines; needlenum++) {
 
@@ -1290,56 +1605,60 @@ int carveImageFile(struct scalpelState *state) {
 	strcpy(carveinfo->filename, fn);
 	carveinfo->start = start;
 	carveinfo->stop = stop;
+	carveinfo->startblock = headerblockindex;
+	carveinfo->stopblock = footerblockindex;
 	carveinfo->chopped = chopped;
-
-	// fp will be allocated when the first byte of the file is
-	// in the current buffer and cleaned up when we encounter the
-	// last byte of the file.
 	carveinfo->fp = 0;
+	carveinfo->completed = 0;
+	carveinfo->opened_once = 0;
+	carveinfo->is_active = 0;
+	carveinfo->iobuf = 0;
+	carveinfo->active_prev = 0;
+	carveinfo->active_next = 0;
+	carveinfo->lru_prev = 0;
+	carveinfo->lru_next = 0;
+	carveinfo->start_next = 0;
+	carveinfo->stop_next = 0;
+	carveinfo->same_next = 0;
 
+	if(!eventsByBlock[headerblockindex].has_work) {
+	  initializedBlocks++;
+	  eventsByBlock[headerblockindex].has_work = TRUE;
+	}
 	if(headerblockindex == footerblockindex) {
-	  // header and footer will both appear in the same buffer
-	  // 실제 작업이 생기는 블록에서만 queue를 초기화한다.
-	  ensureCarvelistInitialized(state, carvelists, carvelistInitialized,
-				     headerblockindex, &initializedQueues);
-	  add_to_queue(&carvelists[headerblockindex],
-		       &carveinfo, STARTSTOPCARVE);
+	  carveinfo->same_next = eventsByBlock[headerblockindex].same_head;
+	  eventsByBlock[headerblockindex].same_head = carveinfo;
 	}
 	else {
-	  // header/footer will appear in different buffers, add carveinfo to 
-	  // stop and start lists...
-	  // 시작/종료 블록과 중간 블록을 모두 필요 시점에만 활성화한다.
-	  ensureCarvelistInitialized(state, carvelists, carvelistInitialized,
-				     headerblockindex, &initializedQueues);
-	  add_to_queue(&carvelists[headerblockindex], &carveinfo, STARTCARVE);
-	  ensureCarvelistInitialized(state, carvelists, carvelistInitialized,
-				     footerblockindex, &initializedQueues);
-	  add_to_queue(&carvelists[footerblockindex], &carveinfo, STOPCARVE);
-	  // .. and to all lists in between (these will result in a full
-	  // SIZE_OF_BUFFER bytes being carved into the file).  
-	  for(j = (long long)headerblockindex + 1; j < (long long)footerblockindex; j++) {
-	    ensureCarvelistInitialized(state, carvelists, carvelistInitialized,
-				       j, &initializedQueues);
-	    add_to_queue(&carvelists[j], &carveinfo, CONTINUECARVE);
-	    // 중간 블록 수는 큐 생성 비용과 후속 쓰기 비용에 직접 연결된다.
-	    continueCarveEntries++;
+	  carveinfo->start_next = eventsByBlock[headerblockindex].start_head;
+	  eventsByBlock[headerblockindex].start_head = carveinfo;
+	  carveinfo->stop_next = eventsByBlock[footerblockindex].stop_head;
+	  eventsByBlock[footerblockindex].stop_head = carveinfo;
+	  for(j = (long long)headerblockindex + 1;
+	      j <= (long long)footerblockindex; j++) {
+	    if(!eventsByBlock[j].has_work) {
+	      initializedBlocks++;
+	      eventsByBlock[j].has_work = TRUE;
+	    }
 	  }
+	  continueCarveSpans += footerblockindex - headerblockindex - 1;
 	}
       }
     }
   }
+  recordQueueTime(queueStartedAt);
 
 #ifdef _WIN32
   fprintf(stdout,
-	  "Work queues built using %I64u/%I64u initialized queues, CONTINUECARVE entries = %I64u.\n",
-	  initializedQueues, queuecount, continueCarveEntries);
+	  "Event schedule built using %I64u/%I64u initialized blocks, CONTINUE spans avoided = %I64u.\n",
+	  initializedBlocks, blockcount, continueCarveSpans);
 #else
   fprintf(stdout,
-	  "Work queues built using %llu/%llu initialized queues, CONTINUECARVE entries = %llu.\n",
-	  initializedQueues, queuecount, continueCarveEntries);
+	  "Event schedule built using %llu/%llu initialized blocks, CONTINUE spans avoided = %llu.\n",
+	  initializedBlocks, blockcount, continueCarveSpans);
 #endif
 
-  fprintf(stdout, "Work queues built.  Workload:\n");
+  fprintf(stdout, "Event schedule built.  Workload:\n");
   for(needlenum = 0; needlenum < state->specLines; needlenum++) {
     currentneedle = &(state->SearchSpec[needlenum]);
     fprintf(stdout, "%s with header \"", currentneedle->suffix);
@@ -1367,25 +1686,20 @@ int carveImageFile(struct scalpelState *state) {
   fprintf(stdout, "Carving files from image.\n");
   fprintf(stdout, "Image file pass 2/2.\n");
 
-  // now read image file in SIZE_OF_BUFFER-sized windows, writing
-  // carved files to output directory
-
+  pass2StartedAt = currentTimeSeconds();
   success = 1;
   while (success) {
-
+    unsigned long long blockindex;
     unsigned long long biglseek = 0L;
-    // goal: skip reading buffers for which there is no work to do by using one big
-    // seek
     fileposition = ftello_use_coverage_map(state, infile);
+    blockindex = fileposition / SIZE_OF_BUFFER;
 
-    // lazy init된 큐만 검사하므로, 미사용 블록은 바로 건너뛴다.
-    while ((!carvelistInitialized[fileposition / SIZE_OF_BUFFER] ||
-	    queue_length(&carvelists[fileposition / SIZE_OF_BUFFER]) == 0)
-	   && success) {
+    while (success && blockindex < blockcount &&
+	   !eventsByBlock[blockindex].has_work) {
       biglseek += SIZE_OF_BUFFER;
       fileposition += SIZE_OF_BUFFER;
       success = fileposition <= filesize;
-
+      blockindex = fileposition / SIZE_OF_BUFFER;
     }
 
     if(success && biglseek) {
@@ -1401,8 +1715,10 @@ int carveImageFile(struct scalpelState *state) {
     }
 
     if(!state->previewMode) {
+      double readStartedAt = currentTimeSeconds();
       bytesread =
 	fread_use_coverage_map(state, readbuffer, 1, SIZE_OF_BUFFER, infile);
+      recordReadTime(readStartedAt);
       // Check for read errors
       if((err = ferror(infile))) {
 	return SCALPEL_ERROR_FILE_READ;
@@ -1442,129 +1758,64 @@ int carveImageFile(struct scalpelState *state) {
 
     // if using coverage map for carving, need adjusted file position
     fileposition = ftello_use_coverage_map(state, infile);
+    blockindex = (fileposition - bytesread) / SIZE_OF_BUFFER;
 
     // signal check
     if(signal_caught == SIGTERM || signal_caught == SIGINT) {
       clean_up(state, signal_caught);
     }
 
-    // deal with work for this SIZE_OF_BUFFER-sized block by
-    // examining the associated queue
-    rewind_queue(&carvelists[(fileposition - bytesread) / SIZE_OF_BUFFER]);
+    {
+      BlockCarveEvents *blockEvents = &eventsByBlock[blockindex];
+      struct CarveInfo *sameCarve = 0;
+      struct CarveInfo *startCarve = 0;
+      struct CarveInfo *activeCarve = 0;
+      struct CarveInfo *nextActive = 0;
+      struct CarveInfo *stopCarve = 0;
+      unsigned long long blockStart = fileposition - bytesread;
 
-    while (!end_of_queue
-	   (&carvelists[(fileposition - bytesread) / SIZE_OF_BUFFER])) {
-      struct CarveInfo *carve;
-      int operation;
-      unsigned long long bytestowrite = 0, byteswritten = 0, offset = 0;
-
-      peek_at_current(&carvelists
-		      [(fileposition - bytesread) / SIZE_OF_BUFFER], &carve);
-      operation =
-	current_priority(&carvelists
-			 [(fileposition - bytesread) / SIZE_OF_BUFFER]);
-
-      // open file, if beginning of carve operation or file had to be closed
-      // previously due to resource limitations
-      if(operation == STARTSTOPCARVE ||
-	 operation == STARTCARVE || carve->fp == 0) {
-
-	if(!state->previewMode && state->modeVerbose) {
-	  fprintf(stdout, "OPENING %s\n", carve->filename);
-	}
-
-	carve->fp = (FILE *) 1;
-	if(!state->previewMode) {
-	  carve->fp = fopen(carve->filename, "ab");
-	}
-
-	if(!carve->fp) {
-	  fprintf(stderr, "Error opening file: %s -- %s\n",
-		  carve->filename, strerror(errno));
-	  fprintf(state->auditFile, "Error opening file: %s -- %s\n",
-		  carve->filename, strerror(errno));
-	  return SCALPEL_ERROR_FILE_WRITE;
-	}
-	else {
-	  CURRENTFILESOPEN++;
+      for(sameCarve = blockEvents->same_head; sameCarve;
+	  sameCarve = sameCarve->same_next) {
+	err = writeCarveBlock(state, &handleCache, sameCarve,
+			      blockStart, bytesread, TRUE);
+	if(err != SCALPEL_OK) {
+	  return err;
 	}
       }
 
-      // write some portion of current readbuffer
-      switch (operation) {
-      case CONTINUECARVE:
-	offset = 0;
-	bytestowrite = SIZE_OF_BUFFER;
-	break;
-      case STARTSTOPCARVE:
-	offset = carve->start - (fileposition - bytesread);
-	bytestowrite = carve->stop - carve->start + 1;
-	break;
-      case STARTCARVE:
-	offset = carve->start - (fileposition - bytesread);
-	bytestowrite = (carve->stop - carve->start + 1) >
-	  (SIZE_OF_BUFFER - offset) ? (SIZE_OF_BUFFER - offset) :
-	  (carve->stop - carve->start + 1);
-	break;
-      case STOPCARVE:
-	offset = 0;
-	bytestowrite = carve->stop - (fileposition - bytesread) + 1;
-	break;
+      for(startCarve = blockEvents->start_head; startCarve;
+	  startCarve = startCarve->start_next) {
+	addActiveCarve(&activeCarves, startCarve, &activeCarveCount,
+		       &peakActiveCarves);
       }
 
-      if(!state->previewMode) {
-//	struct timeval writenow, writethen;
-//	gettimeofday(&writethen, 0);
-	if((byteswritten = fwrite(readbuffer + offset,
-				  sizeof(char),
-				  bytestowrite, carve->fp)) != bytestowrite) {
-
-	  fprintf(stderr, "Error writing to file: %s -- %s\n",
-		  carve->filename, strerror(ferror(carve->fp)));
-	  fprintf(state->auditFile,
-		  "Error writing to file: %s -- %s\n",
-		  carve->filename, strerror(ferror(carve->fp)));
-	  return SCALPEL_ERROR_FILE_WRITE;
+      activeCarve = activeCarves;
+      while(activeCarve) {
+	nextActive = activeCarve->active_next;
+	err = writeCarveBlock(state, &handleCache, activeCarve,
+			      blockStart, bytesread, FALSE);
+	if(err != SCALPEL_OK) {
+	  return err;
 	}
+	if(activeCarve->completed) {
+	  removeActiveCarve(&activeCarves, activeCarve, &activeCarveCount);
+	}
+	activeCarve = nextActive;
       }
 
-      // close file, if necessary.  Always do it on STARTSTOPCARVE and
-      // STOPCARVE, but also do it if we have a large number of files
-      // open, otherwise we'll run out of available file handles.  Updating the
-      // coverage blockmap and auditing is done here, when a file being carved
-      // is closed for the last time.
-      if(operation == STARTSTOPCARVE ||
-	 operation == STOPCARVE || CURRENTFILESOPEN > MAX_FILES_TO_OPEN) {
-	err = 0;
-	if(!state->previewMode) {
-	  if(state->modeVerbose) {
-	    fprintf(stdout, "CLOSING %s\n", carve->filename);
-	  }
-	  err = fclose(carve->fp);
-	}
-
-	if(err) {
-	  fprintf(stderr, "Error closing file: %s -- %s\n\n",
-		  carve->filename, strerror(ferror(carve->fp)));
-	  fprintf(state->auditFile,
-		  "Error closing file: %s -- %s\n\n",
-		  carve->filename, strerror(ferror(carve->fp)));
-	  return SCALPEL_ERROR_FILE_WRITE;
-	}
-	else {
-	  CURRENTFILESOPEN--;
-	  carve->fp = 0;
-
-	  // release filename buffer if it won't be needed again.  Don't release it
-	  // if the file was closed only because a large number of files are currently
-	  // open!
-	  if(operation == STARTSTOPCARVE || operation == STOPCARVE) {
-	    auditUpdateCoverageBlockmap(state, carve);
-	    free(carve->filename);
-	  }
+      for(stopCarve = blockEvents->stop_head; stopCarve;
+	  stopCarve = stopCarve->stop_next) {
+	if(stopCarve->completed) {
+	  removeActiveCarve(&activeCarves, stopCarve, &activeCarveCount);
 	}
       }
-      next_element(&carvelists[(fileposition - bytesread) / SIZE_OF_BUFFER]);
+    }
+  }
+
+  while(handleCache.lru_tail) {
+    err = closeCarveFile(state, &handleCache, handleCache.lru_tail, FALSE);
+    if(err != SCALPEL_OK) {
+      return err;
     }
   }
 
@@ -1584,6 +1835,15 @@ int carveImageFile(struct scalpelState *state) {
   destroyCoverageMaps(state);
 
   printf("Processing of image file complete. Cleaning up...\n");
+  printPerformanceMetrics(currentTimeSeconds() - pass2StartedAt,
+			  handleCache.open_close_sec,
+			  handleCache.open_ops,
+			  handleCache.reopen_ops,
+			  handleCache.close_ops,
+			  handleCache.eviction_ops,
+			  handleCache.peak_open_count,
+			  peakActiveCarves,
+			  handleCache.bytes_written);
 
   // tear down header/footer databases
 
@@ -1604,20 +1864,7 @@ int carveImageFile(struct scalpelState *state) {
     currentneedle->numfilestocarve = 0;
   }
 
-  // tear down work queues--no memory deallocation for each queue
-  // entry required, because memory associated with fp and the
-  // filename was freed after the carved file was closed.
-
-  // destroy queues
-  for(i = 0; i < (long long)queuecount; i++) {
-    // 실제로 초기화한 큐만 정리하면 된다.
-    if(carvelistInitialized[i]) {
-      destroy_queue(&carvelists[i]);
-    }
-  }
-  // destroy array of queues
-  free(carvelistInitialized);
-  free(carvelists);
+  free(eventsByBlock);
 
   printf("Done.");
   return SCALPEL_OK;

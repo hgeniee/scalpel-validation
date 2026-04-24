@@ -2,5 +2,7 @@
 *.py[cod]
 bench/scalpel_bench/results/
 bench/scalpel_bench/results*/
+bench/scalpel_bench/test-optimized/
+bench/scalpel_bench/test-optimized*/
 .idea/
 *.iml

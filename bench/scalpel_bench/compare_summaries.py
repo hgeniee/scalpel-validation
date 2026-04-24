@@ -29,6 +29,22 @@ METRICS = [
     "queue_table_count",
     "queue_initialization_ratio",
     "continue_carve_entries",
+    "initialized_block_count",
+    "event_table_count",
+    "block_activation_ratio",
+    "continue_span_block_count",
+    "pass1_scan_sec",
+    "queue_build_sec",
+    "pass2_read_sec",
+    "pass2_write_sec",
+    "pass2_open_close_sec",
+    "pass2_total_sec",
+    "handle_open_count",
+    "handle_reopen_count",
+    "handle_close_count",
+    "handle_eviction_count",
+    "peak_open_handles",
+    "peak_active_carves",
 ]
 # Metrics that are usually better when lower.
 # user_time_sec, cpu_percent, carved_total_mb, etc. remain contextual because
@@ -41,6 +57,12 @@ LOWER_IS_BETTER = {
     "major_page_faults",
     "voluntary_context_switches",
     "involuntary_context_switches",
+    "pass1_scan_sec",
+    "queue_build_sec",
+    "pass2_read_sec",
+    "pass2_write_sec",
+    "pass2_open_close_sec",
+    "pass2_total_sec",
 }
 
 
