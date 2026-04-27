@@ -227,20 +227,7 @@ typedef struct CarveInfo {
   FILE *fp;			// file descriptor for file to carve
   unsigned long long start;	// offset of first byte in file
   unsigned long long stop;	// offset of last byte in file
-  unsigned long long startblock;	// first SIZE_OF_BUFFER block touched
-  unsigned long long stopblock;	// last SIZE_OF_BUFFER block touched
   char chopped;			// is carved file's length constrained
-  char completed;		// final close and audit completed
-  char opened_once;		// file was already created once
-  char is_active;		// currently present in the active carve set
-  char *iobuf;			// stdio write buffer while file is open
-  struct CarveInfo *active_prev;
-  struct CarveInfo *active_next;
-  struct CarveInfo *lru_prev;
-  struct CarveInfo *lru_next;
-  struct CarveInfo *start_next;
-  struct CarveInfo *stop_next;
-  struct CarveInfo *same_next;
   // by max file size for type? (i.e., could
   // the file actually be longer?
 } CarveInfo;
