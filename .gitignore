@@ -6,3 +6,4 @@ bench/scalpel_bench/test-optimized/
 bench/scalpel_bench/test-optimized*/
 .idea/
 *.iml
+nohup.out
