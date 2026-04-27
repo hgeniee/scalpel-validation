@@ -37,6 +37,11 @@ int ttywidth;
 
 char *__progname;
 
+double totalsearch = 0.0;
+double totalqueues = 0.0;
+double totalreads = 0.0;
+double totalwrites = 0.0;
+
 void usage() {
 
   printf( 
@@ -750,6 +755,11 @@ void digAllFiles(char **argv, struct scalpelState *state) {
 	state->imagefile[strlen(state->imagefile) - 1] = '\x00';
       }
 
+      totalsearch = 0.0;
+      totalqueues = 0.0;
+      totalreads = 0.0;
+      totalwrites = 0.0;
+
       // GGRIII: this function now *only* builds the header/footer
       // database.  Carving is handled afterward, in carveImageFile().
 
@@ -773,6 +783,11 @@ void digAllFiles(char **argv, struct scalpelState *state) {
   else {
     while (*argv) {
       state->imagefile = *argv;
+
+      totalsearch = 0.0;
+      totalqueues = 0.0;
+      totalreads = 0.0;
+      totalwrites = 0.0;
 
       // GGRIII: this function now *only* builds the header/footer
       // database.  Carving is handled afterward, in carveImageFile().

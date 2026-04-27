@@ -21,7 +21,7 @@
 // SIZE_OF_BUFFER indicates how much data to read from an image file
 // at a time. This size should be a multiple of the maximum cluster size
 // that Scalpel will encounter if "quick" mode is ever used.
-#define SIZE_OF_BUFFER            (10 * MEGABYTE)
+#define SIZE_OF_BUFFER            (64 * MEGABYTE)
 
 // The maximum number of patterns of the maximal length the GPU will currently
 // support. Requires statically allocated structures.

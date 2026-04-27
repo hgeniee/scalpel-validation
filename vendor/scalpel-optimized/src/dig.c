@@ -118,9 +118,144 @@ static int setupAuditFile(struct scalpelState *state);
 static int digBuffer(struct scalpelState *state,
 		     unsigned long long lengthofbuf,
 		     unsigned long long offset);
+static int coverageBlockIsMarked(struct scalpelState *state,
+				 unsigned long long block);
+static unsigned long long findNextCoveredBlock(struct scalpelState *state,
+					       unsigned long long block);
+static unsigned long long findNextUncoveredBlock(struct scalpelState *state,
+						 unsigned long long block);
+static double currentTimeSeconds(void);
+static void recordReadTime(double startedAt);
+static void recordWriteTime(double startedAt);
+static void recordQueueTime(double startedAt);
+static void recordSearchTime(double startedAt);
+static void printPerformanceMetrics(double pass2TotalSec,
+				    double pass2OpenCloseSec,
+				    unsigned long long handleOpenCount,
+				    unsigned long long handleReopenCount,
+				    unsigned long long handleCloseCount,
+				    unsigned long long handleEvictionCount,
+				    unsigned long long peakOpenHandles,
+				    unsigned long long peakActiveCarves,
+				    unsigned long long bytesWritten);
 #ifdef MULTICORE_THREADING
 static void *threadedFindAll(void *args);
 #endif
+
+static int
+coverageBlockIsMarked(struct scalpelState *state, unsigned long long block) {
+  return (state->coveragebitmap[block / 8] & (1 << (block % 8))) != 0;
+}
+
+static unsigned long long
+findNextCoveredBlock(struct scalpelState *state, unsigned long long block) {
+  unsigned long long totalBlocks = state->coveragenumblocks;
+
+  while (block < totalBlocks) {
+    unsigned long long byteIndex = block / 8;
+    unsigned int bitOffset = (unsigned int)(block % 8);
+    unsigned char byte = state->coveragebitmap[byteIndex];
+
+    if(bitOffset != 0) {
+      byte &= (unsigned char)(0xFFu << bitOffset);
+    }
+
+    if(byte != 0) {
+      unsigned int firstBit = (unsigned int)__builtin_ctz((unsigned int)byte);
+      return (byteIndex * 8ULL) + firstBit;
+    }
+
+    block = (byteIndex + 1) * 8ULL;
+  }
+
+  return totalBlocks;
+}
+
+static unsigned long long
+findNextUncoveredBlock(struct scalpelState *state, unsigned long long block) {
+  unsigned long long totalBlocks = state->coveragenumblocks;
+
+  while (block < totalBlocks) {
+    unsigned long long byteIndex = block / 8;
+    unsigned int bitOffset = (unsigned int)(block % 8);
+    unsigned char byte = (unsigned char)~state->coveragebitmap[byteIndex];
+
+    if(bitOffset != 0) {
+      byte &= (unsigned char)(0xFFu << bitOffset);
+    }
+
+    if(byte != 0) {
+      unsigned int firstBit = (unsigned int)__builtin_ctz((unsigned int)byte);
+      return (byteIndex * 8ULL) + firstBit;
+    }
+
+    block = (byteIndex + 1) * 8ULL;
+  }
+
+  return totalBlocks;
+}
+
+static double
+currentTimeSeconds(void) {
+#ifdef _WIN32
+  LARGE_INTEGER now;
+  LARGE_INTEGER freq;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&freq);
+  return ((double) now.QuadPart) / ((double) freq.QuadPart);
+#else
+  struct timeval now;
+  gettimeofday(&now, 0);
+  return ((double) now.tv_sec) + (((double) now.tv_usec) / 1000000.0);
+#endif
+}
+
+static void
+recordReadTime(double startedAt) {
+  totalreads += currentTimeSeconds() - startedAt;
+}
+
+static void
+recordWriteTime(double startedAt) {
+  totalwrites += currentTimeSeconds() - startedAt;
+}
+
+static void
+recordQueueTime(double startedAt) {
+  totalqueues += currentTimeSeconds() - startedAt;
+}
+
+static void
+recordSearchTime(double startedAt) {
+  totalsearch += currentTimeSeconds() - startedAt;
+}
+
+static void
+printPerformanceMetrics(double pass2TotalSec,
+			 double pass2OpenCloseSec,
+			 unsigned long long handleOpenCount,
+			 unsigned long long handleReopenCount,
+			 unsigned long long handleCloseCount,
+			 unsigned long long handleEvictionCount,
+			 unsigned long long peakOpenHandles,
+			 unsigned long long peakActiveCarves,
+			 unsigned long long bytesWritten) {
+  fprintf(stdout,
+	  "Performance metrics: pass1_scan_sec=%.6f queue_build_sec=%.6f pass2_read_sec=%.6f pass2_write_sec=%.6f pass2_open_close_sec=%.6f pass2_total_sec=%.6f\n",
+	  totalsearch, totalqueues, totalreads, totalwrites,
+	  pass2OpenCloseSec, pass2TotalSec);
+#ifdef _WIN32
+  fprintf(stdout,
+	  "Performance counters: handle_open_count=%I64u handle_reopen_count=%I64u handle_close_count=%I64u handle_eviction_count=%I64u peak_open_handles=%I64u peak_active_carves=%I64u pass2_bytes_written=%I64u\n",
+	  handleOpenCount, handleReopenCount, handleCloseCount,
+	  handleEvictionCount, peakOpenHandles, peakActiveCarves, bytesWritten);
+#else
+  fprintf(stdout,
+	  "Performance counters: handle_open_count=%llu handle_reopen_count=%llu handle_close_count=%llu handle_eviction_count=%llu peak_open_handles=%llu peak_active_carves=%llu pass2_bytes_written=%llu\n",
+	  handleOpenCount, handleReopenCount, handleCloseCount,
+	  handleEvictionCount, peakOpenHandles, peakActiveCarves, bytesWritten);
+#endif
+}
 
 
 // force header/footer matching to deal with embedded headers/footers
@@ -731,8 +866,13 @@ void *streaming_reader(void *sss) {
 
   // Read chunk of image into empty buffer.
   while ((bytesread =
-	  fread_use_coverage_map(state, rinfo->readbuf, 1, SIZE_OF_BUFFER,
-				 state->infile)) > longestneedle - 1) {
+	  ({
+	    double readStartedAt = currentTimeSeconds();
+	    size_t bytes = fread_use_coverage_map(state, rinfo->readbuf, 1,
+						 SIZE_OF_BUFFER, state->infile);
+	    recordReadTime(readStartedAt);
+	    bytes;
+	  })) > longestneedle - 1) {
 
     if(state->modeVerbose) {
 #ifdef _WIN32
@@ -784,6 +924,9 @@ void *streaming_reader(void *sss) {
   // Done reading image.
   reads_finished = TRUE;
   if (state->infile) {
+#ifdef __linux
+    posix_fadvise(fileno(state->infile), 0, 0, POSIX_FADV_DONTNEED);
+#endif
     fclose(state->infile);
   }
   pthread_exit(0);
@@ -824,6 +967,7 @@ int digImageFile(struct scalpelState *state) {
 #endif
 #ifdef __linux
   fcntl(fileno(state->infile), F_SETFL, O_LARGEFILE);
+  posix_fadvise(fileno(state->infile), 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
 
   // skip initial portion of input file, if that cmd line option
@@ -894,15 +1038,21 @@ int digImageFile(struct scalpelState *state) {
 
     readbuf_info *rinfo = (readbuf_info *)get(full_readbuf);
     readbuffer = rinfo->readbuf;
-    if((status =
-	digBuffer(state, rinfo->bytesread, rinfo->beginreadpos
-		  )) != SCALPEL_OK) {
+    {
+      double searchStartedAt = currentTimeSeconds();
+      status = digBuffer(state, rinfo->bytesread, rinfo->beginreadpos);
+      recordSearchTime(searchStartedAt);
+    }
+    if(status != SCALPEL_OK) {
+      pthread_join(reader, NULL);
       return status;
     }
     put(empty_readbuf, (void *)rinfo);
   }
 
 #endif
+
+  pthread_join(reader, NULL);
 
   return SCALPEL_OK;
 }
@@ -936,6 +1086,16 @@ int carveImageFile(struct scalpelState *state) {
   char chopped;			// file chopped because it exceeds
   // max carve size for type?
   int CURRENTFILESOPEN = 0;	// number of files open (during carve)
+  double queueStartedAt = 0.0;
+  double pass2StartedAt = 0.0;
+  double pass2OpenCloseSec = 0.0;
+  unsigned long long handleOpenCount = 0;
+  unsigned long long handleReopenCount = 0;
+  unsigned long long handleCloseCount = 0;
+  unsigned long long handleEvictionCount = 0;
+  unsigned long long peakOpenHandles = 0;
+  unsigned long long peakActiveCarves = 0;
+  unsigned long long pass2BytesWritten = 0;
   unsigned long long firstcandidatefooter=0;
 
   // index of header and footer within image file, in SIZE_OF_BUFFER
@@ -960,6 +1120,7 @@ int carveImageFile(struct scalpelState *state) {
 #endif
 #ifdef __linux
   fcntl(fileno(infile), F_SETFL, O_LARGEFILE);
+  posix_fadvise(fileno(infile), 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
 
   // If skip was activated, then there's no way headers/footers were
@@ -981,6 +1142,7 @@ int carveImageFile(struct scalpelState *state) {
 
 
 //  gettimeofday(&queuethen, 0);
+  queueStartedAt = currentTimeSeconds();
 
   // allocate memory for carvelists--we alloc a queue for each
   // SIZE_OF_BUFFER bytes in advance because it's simpler and an empty
@@ -1246,6 +1408,7 @@ int carveImageFile(struct scalpelState *state) {
   }
 
   fprintf(stdout, "Work queues built.  Workload:\n");
+  recordQueueTime(queueStartedAt);
   for(needlenum = 0; needlenum < state->specLines; needlenum++) {
     currentneedle = &(state->SearchSpec[needlenum]);
     fprintf(stdout, "%s with header \"", currentneedle->suffix);
@@ -1276,10 +1439,12 @@ int carveImageFile(struct scalpelState *state) {
   // now read image file in SIZE_OF_BUFFER-sized windows, writing
   // carved files to output directory
 
+  pass2StartedAt = currentTimeSeconds();
   success = 1;
   while (success) {
 
     unsigned long long biglseek = 0L;
+    unsigned long long activeCarvesThisBlock = 0;
     // goal: skip reading buffers for which there is no work to do by using one big
     // seek
     fileposition = ftello_use_coverage_map(state, infile);
@@ -1305,8 +1470,10 @@ int carveImageFile(struct scalpelState *state) {
     }
 
     if(!state->previewMode) {
+      double readStartedAt = currentTimeSeconds();
       bytesread =
 	fread_use_coverage_map(state, readbuffer, 1, SIZE_OF_BUFFER, infile);
+      recordReadTime(readStartedAt);
       // Check for read errors
       if((err = ferror(infile))) {
 	return SCALPEL_ERROR_FILE_READ;
@@ -1361,6 +1528,9 @@ int carveImageFile(struct scalpelState *state) {
       struct CarveInfo *carve;
       int operation;
       unsigned long long bytestowrite = 0, byteswritten = 0, offset = 0;
+      int reopenedHandle = FALSE;
+
+      activeCarvesThisBlock++;
 
       peek_at_current(&carvelists
 		      [(fileposition - bytesread) / SIZE_OF_BUFFER], &carve);
@@ -1379,7 +1549,11 @@ int carveImageFile(struct scalpelState *state) {
 
 	carve->fp = (FILE *) 1;
 	if(!state->previewMode) {
+	  double openStartedAt = currentTimeSeconds();
+	  reopenedHandle =
+	    (operation != STARTSTOPCARVE && operation != STARTCARVE);
 	  carve->fp = fopen(carve->filename, "ab");
+	  pass2OpenCloseSec += currentTimeSeconds() - openStartedAt;
 	}
 
 	if(!carve->fp) {
@@ -1391,6 +1565,13 @@ int carveImageFile(struct scalpelState *state) {
 	}
 	else {
 	  CURRENTFILESOPEN++;
+	  handleOpenCount++;
+	  if(reopenedHandle) {
+	    handleReopenCount++;
+	  }
+	  if((unsigned long long)CURRENTFILESOPEN > peakOpenHandles) {
+	    peakOpenHandles = (unsigned long long)CURRENTFILESOPEN;
+	  }
 	}
       }
 
@@ -1417,11 +1598,11 @@ int carveImageFile(struct scalpelState *state) {
       }
 
       if(!state->previewMode) {
-//	struct timeval writenow, writethen;
-//	gettimeofday(&writethen, 0);
+	double writeStartedAt = currentTimeSeconds();
 	if((byteswritten = fwrite(readbuffer + offset,
 				  sizeof(char),
 				  bytestowrite, carve->fp)) != bytestowrite) {
+	  recordWriteTime(writeStartedAt);
 
 	  fprintf(stderr, "Error writing to file: %s -- %s\n",
 		  carve->filename, strerror(ferror(carve->fp)));
@@ -1430,6 +1611,8 @@ int carveImageFile(struct scalpelState *state) {
 		  carve->filename, strerror(ferror(carve->fp)));
 	  return SCALPEL_ERROR_FILE_WRITE;
 	}
+	recordWriteTime(writeStartedAt);
+	pass2BytesWritten += byteswritten;
       }
 
       // close file, if necessary.  Always do it on STARTSTOPCARVE and
@@ -1444,7 +1627,11 @@ int carveImageFile(struct scalpelState *state) {
 	  if(state->modeVerbose) {
 	    fprintf(stdout, "CLOSING %s\n", carve->filename);
 	  }
+	  {
+	    double closeStartedAt = currentTimeSeconds();
 	  err = fclose(carve->fp);
+	    pass2OpenCloseSec += currentTimeSeconds() - closeStartedAt;
+	  }
 	}
 
 	if(err) {
@@ -1457,6 +1644,10 @@ int carveImageFile(struct scalpelState *state) {
 	}
 	else {
 	  CURRENTFILESOPEN--;
+	  handleCloseCount++;
+	  if(operation != STARTSTOPCARVE && operation != STOPCARVE) {
+	    handleEvictionCount++;
+	  }
 	  carve->fp = 0;
 
 	  // release filename buffer if it won't be needed again.  Don't release it
@@ -1469,6 +1660,10 @@ int carveImageFile(struct scalpelState *state) {
 	}
       }
       next_element(&carvelists[(fileposition - bytesread) / SIZE_OF_BUFFER]);
+    }
+
+    if(activeCarvesThisBlock > peakActiveCarves) {
+      peakActiveCarves = activeCarvesThisBlock;
     }
   }
 
@@ -1518,6 +1713,16 @@ int carveImageFile(struct scalpelState *state) {
   }
   // destroy array of queues
   free(carvelists);
+
+  printPerformanceMetrics(currentTimeSeconds() - pass2StartedAt,
+			  pass2OpenCloseSec,
+			  handleOpenCount,
+			  handleReopenCount,
+			  handleCloseCount,
+			  handleEvictionCount,
+			  peakOpenHandles,
+			  peakActiveCarves,
+			  pass2BytesWritten);
 
   printf("Done.");
   return SCALPEL_OK;
@@ -2002,6 +2207,46 @@ fseeko_use_coverage_map(struct scalpelState *state, FILE * fp, off64_t offset) {
 
     curblock = currentpos / state->coverageblocksize;
 
+    if(sign > 0) {
+      unsigned long long remaining = (unsigned long long) offset;
+      while (remaining > 0 && curblock < state->coveragenumblocks) {
+	unsigned long long nextCovered = findNextCoveredBlock(state, curblock);
+	unsigned long long uncoveredBlocks = nextCovered > curblock ?
+	  (nextCovered - curblock) : 0;
+	unsigned long long uncoveredBytes = uncoveredBlocks * state->coverageblocksize;
+
+	if(currentpos % state->coverageblocksize) {
+	  uncoveredBytes -= (currentpos % state->coverageblocksize);
+	}
+
+	if(uncoveredBytes >= remaining) {
+	  break;
+	}
+
+	remaining -= uncoveredBytes;
+	currentpos += uncoveredBytes;
+	curblock = nextCovered;
+
+	if(curblock >= state->coveragenumblocks) {
+	  break;
+	}
+
+	{
+	  unsigned long long nextUncovered =
+	    findNextUncoveredBlock(state, curblock);
+	  unsigned long long coveredBlocks = nextUncovered - curblock;
+	  unsigned long long coveredBytes =
+	    coveredBlocks * state->coverageblocksize;
+
+	  offset += coveredBytes;
+	  currentpos += coveredBytes;
+	  curblock = nextUncovered;
+	}
+      }
+
+      return fseeko(fp, offset, SEEK_CUR);
+    }
+
     while (totalbytes < (offset > 0 ? offset : offset * -1) &&
 	   curblock < state->coveragenumblocks) {
       bytestoskip = 0;
@@ -2127,12 +2372,14 @@ fread_use_coverage_map(struct scalpelState *state, void *ptr,
       bytestoread = 0;
       bytestoskip = 0;
 
-      // skip covered blocks
-      while (curblock < state->coveragenumblocks &&
-	     (state->coveragebitmap[curblock / 8] & (1 << (curblock % 8)))) {
-	bytestoskip += (state->coverageblocksize -
-			curpos % state->coverageblocksize);
-	curblock++;
+      if(coverageBlockIsMarked(state, curblock)) {
+	unsigned long long nextUncovered =
+	  findNextUncoveredBlock(state, curblock);
+	bytestoskip = (nextUncovered - curblock) * state->coverageblocksize;
+	if(curpos % state->coverageblocksize) {
+	  bytestoskip -= (curpos % state->coverageblocksize);
+	}
+	curblock = nextUncovered;
       }
 
       curpos += bytestoskip;
@@ -2150,16 +2397,13 @@ fread_use_coverage_map(struct scalpelState *state, void *ptr,
 
       fseeko(stream, (off64_t) bytestoskip, SEEK_CUR);
 
-      // accumulate uncovered blocks for read
-      while (curblock < state->coveragenumblocks &&
-	     ((state->
-	       coveragebitmap[curblock / 8] & (1 << (curblock % 8))) == 0)
-	     && totalbytesread + bytestoread <= neededbytes) {
-
-	bytestoread += (state->coverageblocksize -
-			curpos % state->coverageblocksize);
-
-	curblock++;
+      if(curblock < state->coveragenumblocks) {
+	unsigned long long nextCovered =
+	  findNextCoveredBlock(state, curblock);
+	bytestoread = (nextCovered - curblock) * state->coverageblocksize;
+	if(curpos % state->coverageblocksize) {
+	  bytestoread -= (curpos % state->coverageblocksize);
+	}
       }
 
       // cap read size
