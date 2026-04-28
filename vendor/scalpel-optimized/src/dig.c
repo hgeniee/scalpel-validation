@@ -149,23 +149,26 @@ coverageBlockIsMarked(struct scalpelState *state, unsigned long long block) {
 
 static unsigned long long
 findNextCoveredBlock(struct scalpelState *state, unsigned long long block) {
+ // 비트맵에 기록된 전체 블록이 몇개인지 확인, 탐색하다가 지도의 끝을 넘어가면 안 되기 때문
   unsigned long long totalBlocks = state->coveragenumblocks;
-
+  // 비트맵은 1바이트에 8개의 블록 상태를 담음
   while (block < totalBlocks) {
-    unsigned long long byteIndex = block / 8;
-    unsigned int bitOffset = (unsigned int)(block % 8);
-    unsigned char byte = state->coveragebitmap[byteIndex];
+    unsigned long long byteIndex = block / 8; // 몇번째 바이트인가?
+    unsigned int bitOffset = (unsigned int)(block % 8); // 바이트 안의 몇번째 비트인가?
+    unsigned char byte = state->coveragebitmap[byteIndex]; // 실제 데이터 8비트 읽기
 
+    // 0xFF를 왼쪽으로 밀어서 앞부분 0으로 만듦
     if(bitOffset != 0) {
       byte &= (unsigned char)(0xFFu << bitOffset);
     }
 
+    // 가리고 남은 비트 중에 1이 하나라도 있다면 이 바이트 안에 내가 찾는 블록이 있다는 뜻
     if(byte != 0) {
-      unsigned int firstBit = (unsigned int)__builtin_ctz((unsigned int)byte);
+      unsigned int firstBit = (unsigned int)__builtin_ctz((unsigned int)byte); // 오른쪽 끝에서부터 0이 몇개인지를 CPU가 광속으로 계산
       return (byteIndex * 8ULL) + firstBit;
     }
 
-    block = (byteIndex + 1) * 8ULL;
+    block = (byteIndex + 1) * 8ULL; // 현재 바이트를 다 뒤졌는데 1이 없다면 다음 8개 블록으로 점프
   }
 
   return totalBlocks;
