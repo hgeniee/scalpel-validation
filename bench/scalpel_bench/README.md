@@ -113,3 +113,43 @@ Ubuntu / Bash:
 This writes per-run folders such as `baseline-run-01` and `optimized-run-01`,
 then generates `comparison.json` with aggregate statistics and short
 observations that are easier to reuse in the paper draft.
+
+## Buffer sweep
+
+To isolate whether larger read buffers are driving the speedup, run the same
+optimized source with several `SIZE_OF_BUFFER` values:
+
+```powershell
+pwsh bench\scalpel_bench\run_buffer_sweep.ps1 `
+  -SourceSubdir vendor/scalpel-optimized `
+  -ImagePath C:\cases\disk.dd `
+  -OutputRoot C:\repo\bench\scalpel_bench\results\buffer-sweep `
+  -BufferSizesMB 64,32,16,10 `
+  -RepeatCount 3
+```
+
+This script:
+
+- keeps generated variant sources under `bench/scalpel_bench/generated_sources/buffer-sweep`
+- rewrites `src/common.h` so each clone has a different `SIZE_OF_BUFFER`
+- builds one worker image per buffer size
+- writes per-run outputs such as `buffer-064mb-run-01`
+- generates `buffer_sweep_summary.json` ranking buffer sizes by mean elapsed time
+
+Use the largest buffer as the reference point, then inspect how `elapsed_sec`,
+`pass1_scan_sec`, `pass2_read_sec`, and `max_rss_mb` move as the buffer shrinks.
+
+Ubuntu / Bash:
+
+```bash
+nohup ./bench/scalpel_bench/run_buffer_sweep.sh \
+  --source-subdir vendor/scalpel-optimized \
+  --image-path /media/jwlee-server/SSS_24TB_8/512G_disk_delete.img \
+  --output-root /media/jwlee-server/SSS_24TB_8/results/test4-buffer-sweep \
+  --buffer-sizes-mb 64,32,16,10 \
+  --repeat-count 3 &
+```
+
+This produces per-buffer run directories plus `buffer_sweep_summary.json` under
+the chosen output root, so you can compare each reduced buffer directly against
+the 64 MB reference.
