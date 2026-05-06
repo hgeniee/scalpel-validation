@@ -122,6 +122,7 @@ prepare_variant_source() {
   rm -rf "$variant_path"
   mkdir -p "$variant_path"
   cp -a "$source_path/." "$variant_path/"
+  echo "Prepared variant source at $variant_path (SIZE_OF_BUFFER=${buffer_mb}MB)" >&2
 
   common_header="$variant_path/src/common.h"
   if [[ ! -f "$common_header" ]]; then
@@ -137,13 +138,13 @@ import sys
 header = Path(sys.argv[1])
 buffer_mb = sys.argv[2]
 raw = header.read_text(encoding="utf-8")
-updated = re.sub(
+updated, count = re.subn(
     r"#define SIZE_OF_BUFFER\s+\([0-9]+\s+\*\s+MEGABYTE\)",
     f"#define SIZE_OF_BUFFER            ({buffer_mb} * MEGABYTE)",
     raw,
     count=1,
 )
-if updated == raw:
+if count != 1:
     raise SystemExit(f"Failed to replace SIZE_OF_BUFFER in {header}")
 header.write_text(updated, encoding="utf-8")
 PY
@@ -252,6 +253,7 @@ PY
   variant_label="$(printf 'buffer-%03dmb' "$buffer_mb")"
   variant_tag="${TAG_PREFIX}:${buffer_mb}mb"
 
+  echo "Building variant ${variant_label} with image tag ${variant_tag}" >&2
   build_worker_image "$variant_tag" "$relative_source_subdir"
   VARIANT_LABELS+=("$variant_label")
   VARIANT_TAGS+=("$variant_tag")

@@ -80,13 +80,11 @@ function New-VariantSource {
     }
 
     $raw = Get-Content $commonHeader -Raw
-    $updated = $raw -replace `
-        '#define SIZE_OF_BUFFER\s+\([0-9]+\s+\*\s+MEGABYTE\)', `
-        "#define SIZE_OF_BUFFER            ($BufferSizeMB * MEGABYTE)"
-
-    if ($updated -eq $raw) {
+    $pattern = '#define SIZE_OF_BUFFER\s+\([0-9]+\s+\*\s+MEGABYTE\)'
+    if ($raw -notmatch $pattern) {
         throw "Failed to replace SIZE_OF_BUFFER in $commonHeader"
     }
+    $updated = $raw -replace $pattern, "#define SIZE_OF_BUFFER            ($BufferSizeMB * MEGABYTE)"
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($commonHeader, $updated, $utf8NoBom)
